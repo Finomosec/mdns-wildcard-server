@@ -93,6 +93,16 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 ```
 
+## Firewall
+
+If the host runs a firewall, allow inbound multicast DNS (**UDP 5353**) from your LAN
+— otherwise queries from *other* hosts are dropped (same-host resolution still works):
+
+```sh
+# ufw example — adjust the source range to your LAN
+sudo ufw allow from 192.168.0.0/16 to any port 5353 proto udp comment "mdns-wildcard-server"
+```
+
 ## Notes & limitations
 
 - **Link-local:** mDNS multicast is not routed → run one instance per L2 subnet, on a
@@ -101,8 +111,7 @@ WantedBy=multi-user.target
   patterns no real device owns, there are no conflicts.
 - **No probing / conflict defence:** intentionally a pure proxy responder for names
   you "own".
-- **IPv4 multicast group only** for now (`224.0.0.251`); the IPv6 group (`ff02::fb`)
-  is not joined yet.
+- **Dual-stack:** joins both the IPv4 (`224.0.0.251`) and IPv6 (`ff02::fb`) mDNS groups.
 
 ## License
 
