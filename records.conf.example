@@ -1,0 +1,13 @@
+# mdns-wildcard-server — example records (the live file is hot-reloaded)
+#
+# Format:  <pattern>  <ip>
+#   <pattern> = exact name (nas.local) OR wildcard (*.apps.local)
+#   *.X  matches X itself AND any sub-labels before it (a.X, a.b.X, …)
+#   <ip> = IPv4 (A) or IPv6 (AAAA), detected automatically
+# First matching rule wins. '#' starts a comment.
+#
+# Copy this to records.conf and adjust:
+#   cp records.conf.example records.conf
+
+nas.local          192.168.1.10
+*.apps.local       192.168.1.20

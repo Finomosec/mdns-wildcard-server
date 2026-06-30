@@ -1,0 +1,8 @@
+# built binary
+/mdns-wildcard-server
+
+# local runtime config (copy from records.conf.example)
+/records.conf
+
+*.o
+*.out

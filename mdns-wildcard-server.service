@@ -1,0 +1,22 @@
+[Unit]
+Description=mDNS wildcard server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Adjust paths: binary in /usr/local/bin, config in /etc/mdns-wildcard-server/.
+# Set -iface to the LAN interface of this host (mDNS is link-local).
+ExecStart=/usr/local/bin/mdns-wildcard-server -config /etc/mdns-wildcard-server/records.conf -iface eth0
+Restart=on-failure
+RestartSec=2
+
+# Port 5353 is > 1024 -> unprivileged, no root needed.
+DynamicUser=yes
+ReadOnlyPaths=/etc/mdns-wildcard-server
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
