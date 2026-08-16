@@ -219,23 +219,32 @@ func handleQuery(conn *net.UDPConn, group *net.UDPAddr, q *dns.Msg, src *net.UDP
 			unicast = true // QU bit set
 		}
 		name := strings.ToLower(strings.TrimSuffix(qd.Name, "."))
+		var haveA, haveAAAA bool
 		for _, r := range c.rules {
 			if !match(r, name) {
 				continue
 			}
-			if r.v4 && (qd.Qtype == dns.TypeA || qd.Qtype == dns.TypeANY) {
+			if r.v4 && !haveA && (qd.Qtype == dns.TypeA || qd.Qtype == dns.TypeANY) {
 				answers = append(answers, &dns.A{
 					Hdr: dns.RR_Header{Name: qd.Name, Rrtype: dns.TypeA, Class: class, Ttl: ttl},
 					A:   r.ip,
 				})
+				haveA = true
 			}
-			if !r.v4 && (qd.Qtype == dns.TypeAAAA || qd.Qtype == dns.TypeANY) {
+			if !r.v4 && !haveAAAA && (qd.Qtype == dns.TypeAAAA || qd.Qtype == dns.TypeANY) {
 				answers = append(answers, &dns.AAAA{
 					Hdr:  dns.RR_Header{Name: qd.Name, Rrtype: dns.TypeAAAA, Class: class, Ttl: ttl},
 					AAAA: r.ip,
 				})
+				haveAAAA = true
 			}
-			break // first matching rule wins
+			// first matching rule *per type* wins (specific shadows wildcard),
+			// but allow a name to carry both an A and an AAAA rule (dual-stack).
+			if (qd.Qtype == dns.TypeA && haveA) ||
+				(qd.Qtype == dns.TypeAAAA && haveAAAA) ||
+				(qd.Qtype == dns.TypeANY && haveA && haveAAAA) {
+				break
+			}
 		}
 	}
 	if len(answers) == 0 {
