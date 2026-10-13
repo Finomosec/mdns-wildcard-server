@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/miekg/dns"
@@ -38,6 +39,11 @@ const (
 	topBit = 0x8000
 	// Legacy unicast answers should use a short TTL (RFC 6762 §6.7).
 	legacyMaxTTL = 10
+	// Announcements: at least two unsolicited responses, one second apart (RFC 6762 §8.3).
+	announceCount    = 2
+	announceInterval = time.Second
+	// Keeps an announcement packet below a 1500-byte MTU incl. IPv6/UDP headers.
+	maxPacketLen = 1400
 )
 
 type rule struct {
@@ -52,9 +58,16 @@ type config struct {
 	ttl   uint32
 }
 
+type sender struct {
+	conn  *net.UDPConn
+	group *net.UDPAddr
+}
+
 var (
 	cur     atomic.Pointer[config]
 	verbose bool
+	// senders is filled in main before announcing and never changed afterwards.
+	senders []sender
 )
 
 func main() {
@@ -79,23 +92,26 @@ func main() {
 	cur.Store(c)
 	log.Printf("start: %d rule(s) from %q, TTL %ds, iface=%s", len(c.rules), *cfgPath, *ttl, ifaceName(ifi))
 
-	go watchConfig(*cfgPath, uint32(*ttl))
-
 	// IPv4 is required; IPv6 is best-effort (some hosts have no usable v6).
 	conn4, group4, err := openMulticast4(ifi)
 	if err != nil {
 		log.Fatalf("opening IPv4 mDNS socket failed: %v", err)
 	}
 	defer conn4.Close()
+	senders = append(senders, sender{conn4, group4})
 	go serve(conn4, group4)
 
 	if conn6, group6, err := openMulticast6(ifi); err != nil {
 		log.Printf("IPv6 mDNS disabled: %v", err)
 	} else {
 		defer conn6.Close()
+		senders = append(senders, sender{conn6, group6})
 		go serve(conn6, group6)
 		log.Printf("IPv6 mDNS enabled (%s)", mdnsGroup6)
 	}
+
+	go announce(c)
+	go watchConfig(*cfgPath, uint32(*ttl))
 
 	select {} // block forever; serve loops run in goroutines
 }
@@ -218,33 +234,18 @@ func handleQuery(conn *net.UDPConn, group *net.UDPAddr, q *dns.Msg, src *net.UDP
 		if qd.Qclass&topBit != 0 {
 			unicast = true // QU bit set
 		}
-		name := strings.ToLower(strings.TrimSuffix(qd.Name, "."))
-		var haveA, haveAAAA bool
-		for _, r := range c.rules {
-			if !match(r, name) {
-				continue
-			}
-			if r.v4 && !haveA && (qd.Qtype == dns.TypeA || qd.Qtype == dns.TypeANY) {
-				answers = append(answers, &dns.A{
-					Hdr: dns.RR_Header{Name: qd.Name, Rrtype: dns.TypeA, Class: class, Ttl: ttl},
-					A:   r.ip,
-				})
-				haveA = true
-			}
-			if !r.v4 && !haveAAAA && (qd.Qtype == dns.TypeAAAA || qd.Qtype == dns.TypeANY) {
-				answers = append(answers, &dns.AAAA{
-					Hdr:  dns.RR_Header{Name: qd.Name, Rrtype: dns.TypeAAAA, Class: class, Ttl: ttl},
-					AAAA: r.ip,
-				})
-				haveAAAA = true
-			}
-			// first matching rule *per type* wins (specific shadows wildcard),
-			// but allow a name to carry both an A and an AAAA rule (dual-stack).
-			if (qd.Qtype == dns.TypeA && haveA) ||
-				(qd.Qtype == dns.TypeAAAA && haveAAAA) ||
-				(qd.Qtype == dns.TypeANY && haveA && haveAAAA) {
-				break
-			}
+		a, aaaa := resolve(c, strings.ToLower(strings.TrimSuffix(qd.Name, ".")))
+		if a != nil && (qd.Qtype == dns.TypeA || qd.Qtype == dns.TypeANY) {
+			answers = append(answers, &dns.A{
+				Hdr: dns.RR_Header{Name: qd.Name, Rrtype: dns.TypeA, Class: class, Ttl: ttl},
+				A:   a,
+			})
+		}
+		if aaaa != nil && (qd.Qtype == dns.TypeAAAA || qd.Qtype == dns.TypeANY) {
+			answers = append(answers, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: qd.Name, Rrtype: dns.TypeAAAA, Class: class, Ttl: ttl},
+				AAAA: aaaa,
+			})
 		}
 	}
 	if len(answers) == 0 {
@@ -287,6 +288,108 @@ func handleQuery(conn *net.UDPConn, group *net.UDPAddr, q *dns.Msg, src *net.UDP
 		}
 		log.Printf("answer (%s) to %s: %s", mode, dst, strings.Join(names, ", "))
 	}
+}
+
+// resolve returns the addresses for name. The first matching rule *per type* wins
+// (specific shadows wildcard by order), so a name can carry both an A and an AAAA
+// rule (dual-stack).
+func resolve(c *config, name string) (a, aaaa net.IP) {
+	for _, r := range c.rules {
+		if !match(r, name) {
+			continue
+		}
+		if r.v4 && a == nil {
+			a = r.ip
+		}
+		if !r.v4 && aaaa == nil {
+			aaaa = r.ip
+		}
+		if a != nil && aaaa != nil {
+			break
+		}
+	}
+	return a, aaaa
+}
+
+// announce sends unsolicited responses for all exact names (RFC 6762 §8.3), so that
+// caches learn new names at once instead of at their querier's next, possibly
+// much later, retry. Wildcards have no concrete name and cannot be announced.
+func announce(c *config) {
+	packets := announcements(c)
+	if len(packets) == 0 {
+		return
+	}
+	for i := 0; i < announceCount; i++ {
+		if i > 0 {
+			time.Sleep(announceInterval)
+		}
+		for _, s := range senders {
+			for _, p := range packets {
+				if _, err := s.conn.WriteToUDP(p, s.group); err != nil {
+					log.Printf("announce to %s failed: %v", s.group, err)
+				}
+			}
+		}
+	}
+	if verbose {
+		log.Printf("announced %d packet(s) %d time(s)", len(packets), announceCount)
+	}
+}
+
+// announcements builds the packed announcement messages for all exact names, split
+// so that each packet stays below maxPacketLen.
+func announcements(c *config) [][]byte {
+	class := uint16(dns.ClassINET) | topBit
+	seen := make(map[string]bool)
+	var records []dns.RR
+	for _, r := range c.rules {
+		if r.wildcard || seen[r.name] {
+			continue
+		}
+		seen[r.name] = true
+		fqdn := dns.Fqdn(r.name)
+		a, aaaa := resolve(c, r.name)
+		if a != nil {
+			records = append(records, &dns.A{
+				Hdr: dns.RR_Header{Name: fqdn, Rrtype: dns.TypeA, Class: class, Ttl: c.ttl},
+				A:   a,
+			})
+		}
+		if aaaa != nil {
+			records = append(records, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: fqdn, Rrtype: dns.TypeAAAA, Class: class, Ttl: c.ttl},
+				AAAA: aaaa,
+			})
+		}
+	}
+
+	var packets [][]byte
+	msg := newAnnouncement()
+	flush := func() {
+		out, err := msg.Pack()
+		if err != nil {
+			log.Printf("pack error: %v", err)
+		} else {
+			packets = append(packets, out)
+		}
+		msg = newAnnouncement()
+	}
+	for _, rr := range records {
+		msg.Answer = append(msg.Answer, rr)
+		if len(msg.Answer) > 1 && msg.Len() > maxPacketLen {
+			msg.Answer = msg.Answer[:len(msg.Answer)-1]
+			flush()
+			msg.Answer = append(msg.Answer, rr)
+		}
+	}
+	if len(msg.Answer) > 0 {
+		flush()
+	}
+	return packets
+}
+
+func newAnnouncement() *dns.Msg {
+	return &dns.Msg{MsgHdr: dns.MsgHdr{Response: true, Authoritative: true}, Compress: true}
 }
 
 func match(r rule, name string) bool {
@@ -364,6 +467,7 @@ func watchConfig(path string, ttl uint32) {
 		}
 		cur.Store(c)
 		log.Printf("config reloaded (%s): %d rule(s)", reason, len(c.rules))
+		go announce(c)
 	}
 
 	for {

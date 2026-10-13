@@ -15,6 +15,11 @@ your LAN without per-host configuration.
 - **Static config**, no upstream DNS dependency.
 - **Hot reload:** edit the config and it's picked up instantly (fsnotify) — or send
   `SIGHUP`. An invalid config is rejected and the previous one stays active.
+- **Announcements:** on start and after every reload, all exact names are announced
+  (two unsolicited responses, 1 s apart, RFC 6762 §8.3). Caches such as avahi learn
+  new names at once — otherwise a client that already looked a name up in vain only
+  asks again after its retry interval, which grows up to one hour. Wildcards have no
+  concrete name and are not announced.
 - IPv4 (A) and IPv6 (AAAA) records, auto-detected.
 - Correct mDNS behaviour: QU-bit / legacy-unicast handling, cache-flush bit, valid
   source address.
